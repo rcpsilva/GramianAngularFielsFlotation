@@ -26,6 +26,9 @@ import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, root_mean_squared_error
 from sklearn.metrics import mean_absolute_percentage_error
 import lightgbm as lgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
 
 from data_splits import make_loaders   # Step 2 util
 
@@ -232,6 +235,71 @@ def predict_xgb(model, loader):
     X_te, y_te = _flatten(loader)
     return y_te, model.predict(X_te, iteration_range=(0, model.best_iteration + 1))
 
+# ──────────────────────────────────────────────────────────────
+# Visualization
+# ──────────────────────────────────────────────────────────────
+
+def plot_predictions(results_dict, all_preds, save_path="baseline_plot.png"):
+    plt.figure(figsize=(10, 8))
+    for name, (y_true, y_pred) in all_preds.items():
+        plt.scatter(y_true, y_pred, label=name, alpha=0.4, s=20)
+
+    min_y = min(min(y) for y, _ in all_preds.values())
+    max_y = max(max(y) for y, _ in all_preds.values())
+    plt.plot([min_y, max_y], [min_y, max_y], "--k", label="Ideal")
+
+    plt.xlabel("True % Silica Concentrate")
+    plt.ylabel("Predicted")
+    plt.title("Test Set Predictions by Method")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.show()
+
+def plot_abs_error_violin(all_preds, save_path="baseline_violin.png"):
+    """Plot violin plots of absolute errors for each method."""
+    data = []
+    for method, (y_true, y_pred) in all_preds.items():
+        abs_err = np.abs(np.array(y_true) - np.array(y_pred))
+        for e in abs_err:
+            data.append({"Method": method, "AbsError": e})
+
+    df = pd.DataFrame(data)
+    plt.figure(figsize=(10, 6))
+    sns.violinplot(data=df, x="Method", y="AbsError", inner="quartile", cut=0)
+    plt.title("Absolute Error Distributions on Test Set")
+    plt.ylabel("Absolute Error")
+    plt.xlabel("Baseline Method")
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.show()
+
+def plot_timeseries(all_preds, max_points=500, save_path="baseline_timeseries.png"):
+    """
+    Plot true vs predicted values for each model as time series curves.
+    Shows up to `max_points` (for readability).
+    """
+    plt.figure(figsize=(12, 6))
+    
+    # Choose any one method to get ground truth (they're the same for all)
+    any_y_true = next(iter(all_preds.values()))[0]
+    y_true = np.array(any_y_true[:max_points])
+    plt.plot(y_true, label="True", color="black", linewidth=2)
+
+    for method, (y_true_m, y_pred_m) in all_preds.items():
+        y_pred_m = np.array(y_pred_m[:max_points])
+        plt.plot(y_pred_m, label=method, alpha=0.8)
+
+    plt.title(f"True vs Predicted Time Series (First {max_points} Points)")
+    plt.xlabel("Timestep (relative index)")
+    plt.ylabel("% Silica Concentrate")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.show()
 
 # ──────────────────────────────────────────────────────────────
 # MAIN – extend run_all() with the two new baselines
@@ -276,7 +344,23 @@ def run_all(data_path="data_raw.npz", out_json="baseline_results.json"):
     print(json.dumps(results, indent=4))
     print(f"⏱  Total runtime: {time.time()-t0:.1f}s")
 
+    # Collect all prediction pairs for plotting
+    all_preds = {
+        "LastValue": predict_last_value(test_loader),
+        "MovingAvg48": predict_mavg(test_loader),
+        #"LightGBM": predict_lgb(booster, test_loader),  # uncomment if LGBM is reenabled
+        "TinyCNN": predict_cnn(cnn, test_loader),
+        "RandomForest": predict_rf(rf, test_loader),
+        "XGBoost": predict_xgb(xgb_model, test_loader),
+    }
+    plot_predictions(results, all_preds, save_path="baseline_plot.png")
+    plot_abs_error_violin(all_preds, save_path="baseline_violin.png")
+    plot_timeseries(all_preds, save_path="baseline_timeseries.png")
+
+
 # ──────────────────────────────────────────────────────────────
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data_raw.npz")

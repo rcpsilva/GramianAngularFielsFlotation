@@ -12,7 +12,7 @@ from gaf import build_forecast_gaf_dataset          # already implemented:conten
 # -------------------------
 # configurable parameters
 # -------------------------
-CSV_PATH   = Path(r"C:\Users\rcpsi\OneDrive\Documents\GitHub\flotation_forecast\RSPlayground\GAF\data_cleaned.csv")
+CSV_PATH   = Path(r"data_cleaned.csv")
 TARGET_COL = "% Silica Concentrate"
 WINDOW     = 48          # 48 hours
 HORIZON    = 1           # one-step-ahead
