@@ -11,7 +11,7 @@ CSV   = "data_cleaned.csv"      # passes through prepare_datasets
 VITS  = ["vit_tiny_patch16_224",
          "vit_small_patch16_224",
          "vit_base_patch16_224"]
-WINDOWS = [24, 48, 96, 144]
+WINDOWS = [24, 24*2, 24*7]
 EPOCHS = [20,100]
 
 
