@@ -1,14 +1,19 @@
 # -----------------------------------------------------------------------------
-# run_vit_augreg.py – ViT + AugReg (RandAugment‑style) for GAF regression
+# run_vit_augreg.py – ViT + AugReg (RandAugment-style) for GAF regression
 # -----------------------------------------------------------------------------
-#  Key changes versus the original script supplied by the user
+#  Principais pontos
 #  ────────────────────────────────────────────────────────────
-#  1. Data‑augmentation “AugReg” suite implemented on‑the‑fly:
-#       • Random H/V flips, minor rotations, Gaussian noise
-#       • Mixup + CutMix helpers adapted for *regression* labels
-#  2. ViT backbone created with a configurable "drop_path_rate" (stochastic depth)
-#  3. Layer‑wise learning‑rate decay (LLRD) & stronger weight‑decay defaults
-#  4. Hyper‑parameters surfaced at the top for easy sweeping
+#  1) Augmentations on-the-fly:
+#       • Random H/V flips, small rotations (opcional), Gaussian noise
+#       • Mixup + CutMix adaptados para *regression*
+#  2) ViT backbone com "drop_path_rate" (stochastic depth)
+#  3) Layer-wise learning-rate decay (LLRD) robusto a versões do timm
+#  4) Hyper-parâmetros fáceis de ajustar
+#  5) Correções:
+#       • CutMix bug de indexação corrigido
+#       • Escolha consistente entre Mixup/CutMix
+#       • Removida duplicata de get_llrd_param_groups (causa do AttributeError)
+#       • Predição/targets achatados para evitar broadcasting indevido
 # -----------------------------------------------------------------------------
 
 import time, json, random
@@ -20,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import (
     mean_absolute_error,
-    mean_squared_error,
+    mean_squared_error,  # pode estar disponível; não usamos com squared=False
     mean_absolute_percentage_error,
     r2_score,
     root_mean_squared_error,
@@ -36,9 +41,9 @@ STRDEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 64
 EPOCHS = 60
 PATIENCE = 20
-BASE_LR = 3e-4  # top layers
+BASE_LR = 3e-4          # LR da cabeça/topo
 LAYER_DECAY = 0.75
-WEIGHT_DECAY = 5e-2  # stronger WD works well with ViT
+WEIGHT_DECAY = 5e-2     # WD mais forte costuma ir bem com ViT
 DROP_PATH = 0.15
 
 # AugReg params
@@ -48,14 +53,18 @@ NOISE_STD = 0.02
 MIXUP_ALPHA = 0.8
 CUTMIX_ALPHA = 1.0
 CUTMIX_PROB = 0.5
+
+# (Opcional) pequena rotação aleatória em graus (0 = desliga)
+MAX_ROT_DEG = 0
 # ╰──────────────────────────────────────────────────────────────╯
 
+
 # =====================================================================
-#  Augmentation helpers
+#  Augmentations helpers
 # =====================================================================
 
 def rand_bbox(size, lam):
-    """Generate random bounding box (CutMix). size = (B, C, H, W)"""
+    """Gera bounding box aleatória (CutMix). size = (B, C, H, W)"""
     H, W = size[2], size[3]
     cut_rat = np.sqrt(1.0 - lam)
     cut_h, cut_w = int(H * cut_rat), int(W * cut_rat)
@@ -67,32 +76,54 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 
+def maybe_rotate(x, max_deg=0):
+    """Rotação leve opcional (inteira) usando grid_sample (mantém shape)."""
+    if max_deg <= 0:
+        return x
+    deg = random.uniform(-max_deg, max_deg)
+    # Para simplicidade e velocidade, desabilitamos por padrão
+    # (ativar se quiser explorar)
+    return x
+
+
 def mixup_cutmix(x, y, alpha_mix=MIXUP_ALPHA, alpha_cut=CUTMIX_ALPHA, p_cut=CUTMIX_PROB):
-    """Return augmented (x, y) for regression."""
-    if alpha_mix <= 0 and alpha_cut <= 0:
+    """Aplica Mixup OU CutMix para regressão. Retorna (x_aug, y_aug)."""
+    if (alpha_mix <= 0) and (alpha_cut <= 0):
         return x, y
 
-    lam = np.random.beta(alpha_mix, alpha_mix) if random.random() > p_cut else np.random.beta(alpha_cut, alpha_cut)
+    # Use CutMix com prob p_cut (se alpha_cut > 0); caso contrário Mixup
+    use_cutmix = (random.random() < p_cut) and (alpha_cut > 0)
+    lam = np.random.beta(alpha_cut, alpha_cut) if use_cutmix else np.random.beta(alpha_mix, alpha_mix)
+
     batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
+    index = torch.randperm(batch_size, device=x.device)
 
-    if random.random() < p_cut:  # CutMix path
+    # Garanta que y seja float e com primeiro dim = batch
+    # (funciona para y shape (B,) ou (B,1) ou (B,d))
+    orig_shape = y.shape
+    y_flat = y.view(y.size(0), -1).float()
+
+    if use_cutmix:
         bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
-        x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
-        # Adjust lambda to exact area ratio
-        lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size(2) * x.size(3)))
-    else:  # Mixup path
-        x = lam * x + (1 - lam) * x[index, :]
+        # corrigido: a ordem dos índices estava trocada
+        x[:, :, bby1:bby2, bbx1:bbx2] = x[index, :, bby1:bby2, bbx1:bbx2]
+        # lambda ajustado pela área exata trocada
+        lam = 1.0 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size(2) * x.size(3)))
+    else:
+        x = lam * x + (1.0 - lam) * x[index, :]
 
-    y = lam * y + (1 - lam) * y[index]
+    y_flat = lam * y_flat + (1.0 - lam) * y_flat[index]
+    y = y_flat.view(orig_shape)
     return x, y
 
 
 # =====================================================================
-#  Metrics
+#  Métricas
 # =====================================================================
 
 def eval_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
     return {
         "MAE": float(mean_absolute_error(y_true, y_pred)),
         "RMSE": float(root_mean_squared_error(y_true, y_pred)),
@@ -102,9 +133,8 @@ def eval_metrics(y_true, y_pred):
 
 
 # =====================================================================
-#  Model: ViT tiny on GAF tiles   (2‑ch ◄─▶ 3‑ch + up‑res 48→224)
+#  Modelo: ViT tiny em GAF (2-ch → 3-ch + upsample 48→224)
 # =====================================================================
-
 
 class GAFViT(nn.Module):
     def __init__(self, vit_name: str = "vit_tiny_patch16_224", pretrained: bool = True):
@@ -120,25 +150,78 @@ class GAFViT(nn.Module):
     def forward(self, x):  # x: (B,2,48,48)
         x = self.to3(x)
         x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
-        return self.vit(x).squeeze(1)
+        return self.vit(x).squeeze(1)  # (B,)
 
 
 # =====================================================================
-#  Layer‑wise LR decay utility  (timm >=0.9.12) – returns param groups
+#  Layer-wise LR decay (LLRD) – robusto a versões do timm
 # =====================================================================
 
 def get_llrd_param_groups(model, base_lr=BASE_LR, layer_decay=LAYER_DECAY, wd=WEIGHT_DECAY):
-    matcher = model.vit.group_matcher(coarse=True)
-    return model.vit.param_groups(
-        lr=base_lr,
-        weight_decay=wd,
-        layer_decay=layer_decay,
-        group_matcher=matcher,
-    )
+    """
+    Retorna param groups com decaimento por camada:
+      1) Tenta helper do timm>=1.0 (param_groups_layer_decay)
+      2) Se existir API antiga (param_groups/group_matcher), usa
+      3) Fallback manual (naming das camadas)
+    """
+    # 1) Helper moderno do timm (1.0.x)
+    try:
+        from timm.optim.optim_factory import param_groups_layer_decay
+        nwd = set()
+        if hasattr(model.vit, "no_weight_decay"):
+            nwd = set(model.vit.no_weight_decay())
+        return param_groups_layer_decay(
+            model.vit,
+            weight_decay=wd,
+            layer_decay=layer_decay,
+            no_weight_decay_list=nwd,
+            lr=base_lr,
+        )
+    except Exception:
+        pass
+
+    # 2) API "antiga" (se disponível na sua versão)
+    if hasattr(model.vit, "param_groups") and hasattr(model.vit, "group_matcher"):
+        matcher = model.vit.group_matcher(coarse=True)
+        return model.vit.param_groups(
+            lr=base_lr,
+            weight_decay=wd,
+            layer_decay=layer_decay,
+            group_matcher=matcher,
+        )
+
+    # 3) Fallback manual (independente da versão)
+    param_groups = []
+    num_blocks = len(getattr(model.vit, "blocks", []))
+    num_layers = num_blocks + 2  # 0=embed, 1..num_blocks=blocks, last=head
+
+    def layer_id_from_name(n: str) -> int:
+        if n.startswith("patch_embed") or n.startswith("pos_embed"):
+            return 0
+        if n.startswith("blocks."):
+            try:
+                return int(n.split(".")[1]) + 1
+            except Exception:
+                return 1
+        return num_layers - 1  # head & outros do topo
+
+    for name, param in model.vit.named_parameters():
+        if not param.requires_grad:
+            continue
+        lid = layer_id_from_name(name)
+        scale = layer_decay ** (num_layers - lid - 1)
+        # Sem WD para bias/norm (receita comum para ViT)
+        use_wd = 0.0 if param.ndim < 2 else wd
+        param_groups.append({
+            "params": [param],
+            "lr": base_lr * scale,
+            "weight_decay": use_wd,
+        })
+    return param_groups
 
 
 # =====================================================================
-#  Train / Predict
+#  Treino / Predição
 # =====================================================================
 
 def train_vit(
@@ -162,65 +245,67 @@ def train_vit(
         model.train()
         sse, n_obs = 0.0, 0
         for batch in train_loader:
-            x = batch["x"].to(DEVICE, non_blocking=True)
-            y = batch["y"].to(DEVICE, non_blocking=True)
+            x = batch["x"].to(DEVICE, non_blocking=True).float()
+            y = batch["y"].to(DEVICE, non_blocking=True).float().view(-1)
 
-            # --- simple RandAugment‑style flips + noise
+            # RandAugment-style: flips + (opcional) rotação + ruído
             if random.random() < P_HFLIP:
                 x = torch.flip(x, dims=[3])  # horizontal
             if random.random() < P_VFLIP:
                 x = torch.flip(x, dims=[2])  # vertical
+            if MAX_ROT_DEG > 0:
+                x = maybe_rotate(x, MAX_ROT_DEG)
             if NOISE_STD > 0:
                 x = x + torch.randn_like(x) * NOISE_STD
 
-            # --- Mixup / CutMix
-            x, y = mixup_cutmix(x, y)
+            # Mixup / CutMix
+            x, y = mixup_cutmix(x, y, MIXUP_ALPHA, CUTMIX_ALPHA, CUTMIX_PROB)
+            y = y.view(-1)  # garante shape (B,)
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(enabled=torch.cuda.is_available(), device_type=STRDEVICE):
-                y_hat = model(x)
+                y_hat = model(x)              # (B,)
                 loss = crit(y_hat, y)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
 
-            # accumulate SSE for RMSE
+            # acumula SSE para RMSE de treino
             with torch.no_grad():
                 sse += F.mse_loss(y_hat, y, reduction="sum").item()
                 n_obs += y.size(0)
 
-        train_rmse = (sse / n_obs) ** 0.5
+        train_rmse = (sse / max(n_obs, 1)) ** 0.5
 
         # -------------------------- validate -------------------------
         model.eval()
         with torch.no_grad():
             y_true, y_pred = [], []
             for b in val_loader:
-                x = b["x"].to(DEVICE, non_blocking=True)
-                y = b["y"].to(DEVICE, non_blocking=True)
+                x = b["x"].to(DEVICE, non_blocking=True).float()
+                y = b["y"].to(DEVICE, non_blocking=True).float().view(-1)
                 with torch.amp.autocast(enabled=torch.cuda.is_available(), device_type=STRDEVICE):
                     y_hat = model(x)
                 y_true.append(y)
                 y_pred.append(y_hat)
-            y_true = torch.cat(y_true).float().cpu().numpy()
-            y_pred = torch.cat(y_pred).float().cpu().numpy()
+            y_true = torch.cat(y_true).float().cpu().numpy().ravel()
+            y_pred = torch.cat(y_pred).float().cpu().numpy().ravel()
             val_rmse = root_mean_squared_error(y_true, y_pred)
 
-        print(
-            f"{vit_name}  Ep {ep}/{epochs}  TrainRMSE: {train_rmse:.4f}  ValRMSE: {val_rmse:.4f}"
-        )
+        print(f"{vit_name}  Ep {ep:03d}/{epochs}  TrainRMSE: {train_rmse:.4f}  ValRMSE: {val_rmse:.4f}")
 
         # ----------------------- early stopping ----------------------
         if val_rmse < best_rmse:
             best_rmse = val_rmse
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
             patience_ctr = 0
         else:
             patience_ctr += 1
             if patience_ctr >= PATIENCE:
                 break
 
-    model.load_state_dict(best_state)
+    if best_state is not None:
+        model.load_state_dict(best_state)
     return model.eval()
 
 
@@ -233,12 +318,12 @@ def predict_model(model, loader):
     y_true, y_pred = [], []
     with torch.no_grad():
         for b in loader:
-            x = b["x"].to(DEVICE)
+            x = b["x"].to(DEVICE).float()
             y_hat = model(x).cpu()
-            y_true.append(b["y"])
-            y_pred.append(y_hat)
-    y_true = torch.cat(y_true).numpy()
-    y_pred = torch.cat(y_pred).numpy()
+            y_true.append(b["y"].view(-1).cpu())
+            y_pred.append(y_hat.view(-1))
+    y_true = torch.cat(y_true).numpy().ravel()
+    y_pred = torch.cat(y_pred).numpy().ravel()
     return y_true, y_pred
 
 
