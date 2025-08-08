@@ -33,18 +33,18 @@ def build_raw_window_dataset(series, window, horizon=1, stride=1):
     y = np.asarray(y, dtype=np.float32)
     return X, y, starts
 
-def main():
+def main(window:int = 48, horizon:int = 1):
     df = pd.read_csv(CSV_PATH)
     series = pd.to_numeric(df[TARGET_COL], errors="coerce")
 
     # --- GAF tiles ---
     Xg, yg, starts = build_forecast_gaf_dataset(
-        series, window=WINDOW, horizon=HORIZON, stride=STRIDE, mode="both")
+        series, window=window, horizon=horizon, stride=STRIDE, mode="both")
     np.savez_compressed("data_gaf.npz", X=Xg, y=yg, starts=starts)
 
     # --- raw 1-D windows ---
     Xr, yr, _ = build_raw_window_dataset(
-        series, window=WINDOW, horizon=HORIZON, stride=STRIDE)
+        series, window=window, horizon=horizon, stride=STRIDE)
     np.savez_compressed("data_raw.npz", X=Xr, y=yr, starts=starts)  # same starts!
 
     print(f"GAF dataset  : {Xg.shape} samples")
@@ -52,4 +52,4 @@ def main():
 
 if __name__ == "__main__":
     np.random.seed(SEED)
-    main()
+    main(WINDOW,HORIZON)
