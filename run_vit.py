@@ -15,7 +15,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 STRDEVICE= "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 64
 EPOCHS = 60
-PATIENCE = 10
+PATIENCE = 20
 LR = 3e-4
 WEIGHT_DECAY = 1e-4
 
