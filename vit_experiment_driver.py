@@ -28,7 +28,7 @@ def main():
         for vit in VITS:
             for epoch in EPOCHS:
                 out_json = f"results_{vit}_W{W}_EP{epoch}.json"
-                _, _, metrics = run_vit_augreg(epochs=epoch, data_path=ds_name,
+                _, _, metrics = run_vit(epochs=epoch, data_path=ds_name,
                                     vit_name=vit,
                                     out_json=out_json)
                 records.append({"epochs": epoch,"window": W, "vit": vit, **metrics})
