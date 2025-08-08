@@ -5,13 +5,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error, r2_score, root_mean_squared_error
 
 import timm  # pip install timm
 
 from data_splits import make_loaders
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+STRDEVICE= "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 64
 EPOCHS = 60
 PATIENCE = 10
@@ -24,7 +25,7 @@ WEIGHT_DECAY = 1e-4
 def eval_metrics(y_true, y_pred):
     return {
         "MAE": float(mean_absolute_error(y_true, y_pred)),
-        "RMSE": float(mean_squared_error(y_true, y_pred, squared=False)),
+        "RMSE": float(root_mean_squared_error(y_true, y_pred)),
         "MAPE": float(mean_absolute_percentage_error(y_true, y_pred)),
         "R2": float(r2_score(y_true, y_pred)),
     }
@@ -51,8 +52,9 @@ class GAFViT(nn.Module):
 # ------------------------------
 # Train / Predict
 # ------------------------------
-def train_vit(train_loader, val_loader, epochs=EPOCHS, lr=LR, wd=WEIGHT_DECAY):
-    model = GAFViT().to(DEVICE)
+def train_vit(train_loader, val_loader,vit_name:str = "vit_tiny_patch16_224",
+              pretrained:bool = True, epochs=EPOCHS, lr=LR, wd=WEIGHT_DECAY):
+    model = GAFViT(vit_name=vit_name, pretrained=pretrained).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     crit = nn.MSELoss()
 
@@ -63,6 +65,7 @@ def train_vit(train_loader, val_loader, epochs=EPOCHS, lr=LR, wd=WEIGHT_DECAY):
     scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
 
     for ep in range(1, epochs + 1):
+        sse, n_obs = 0.0, 0 
         # ---- train ----
         model.train()
         for batch in train_loader:
@@ -70,12 +73,19 @@ def train_vit(train_loader, val_loader, epochs=EPOCHS, lr=LR, wd=WEIGHT_DECAY):
             y = batch["y"].to(DEVICE, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.amp.autocast(enabled=torch.cuda.is_available(),device_type=STRDEVICE):
                 y_hat = model(x)
                 loss = crit(y_hat, y)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
+
+             # ---- accumulate squared error ----
+            with torch.no_grad():                         # no gradients needed
+                sse   += F.mse_loss(y_hat, y, reduction='sum').item()
+                n_obs += y.size(0)
+
+        train_rmse = (sse / n_obs) ** 0.5  
 
         # ---- validate ----
         model.eval()
@@ -84,13 +94,14 @@ def train_vit(train_loader, val_loader, epochs=EPOCHS, lr=LR, wd=WEIGHT_DECAY):
             for b in val_loader:
                 x = b["x"].to(DEVICE)
                 y = b["y"].to(DEVICE)
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                with torch.amp.autocast(enabled=torch.cuda.is_available(),device_type=STRDEVICE):
                     y_hat = model(x)
                 y_true.append(y)
                 y_pred.append(y_hat)
             y_true = torch.cat(y_true).float().cpu().numpy()
             y_pred = torch.cat(y_pred).float().cpu().numpy()
-            val_rmse = mean_squared_error(y_true, y_pred, squared=False)
+            val_rmse = root_mean_squared_error(y_true, y_pred)
+            print(f'{vit_name} {epochs}/{ep} TrainRMSE: {train_rmse} ValRMSE: {val_rmse}')
 
         if val_rmse < best_rmse:
             best_rmse = val_rmse
@@ -120,13 +131,14 @@ def predict_model(model, loader):
 # ------------------------------
 # Runner
 # ------------------------------
-def run_vit(data_path="data_gaf.npz", out_json="vit_results.json"):
+def run_vit(epochs:int=20, vit_name:str = "vit_tiny_patch16_224", pretrained:bool = True, data_path="data_gaf.npz", out_json="vit_results.json"):
     t0 = time.time()
     train_loader, val_loader, test_loader = make_loaders(
         path=data_path, dataset_kind="gaf", batch_size=BATCH_SIZE
     )
 
-    model = train_vit(train_loader, val_loader)
+    model = train_vit(train_loader, val_loader, vit_name,
+              pretrained, epochs=epochs, lr=LR, wd=WEIGHT_DECAY)
     y_true, y_pred = predict_model(model, test_loader)
     results = eval_metrics(y_true, y_pred)
 
