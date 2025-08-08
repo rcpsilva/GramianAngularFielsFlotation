@@ -19,19 +19,29 @@ WINDOW = 48  # for 48x48 GAF
 class GAFResNet18(nn.Module):
     def __init__(self):
         super().__init__()
-        base = models.resnet18(weights=None)
-        base.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.features = nn.Sequential(*list(base.children())[:-1])  # remove FC
-        self.fc = nn.Linear(512, 1)
+        # Load pretrained ResNet18
+        base = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+        # Adapt the first conv layer to accept 2 channels instead of 3
+        old_conv1 = base.conv1  # original (64, 3, 7, 7)
+        new_conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            new_conv1.weight[:, :2, :, :] = old_conv1.weight[:, :2, :, :]
+        base.conv1 = new_conv1
+
+        # Use all feature layers, remove the classification head
+        self.features = nn.Sequential(*list(base.children())[:-1])  # (B, 512, 1, 1)
+        self.fc = nn.Linear(512, 1)  # Regression head
 
     def forward(self, x):  # (B, 2, 48, 48)
         x = self.features(x).squeeze(-1).squeeze(-1)  # -> (B, 512)
         return self.fc(x).squeeze(1)
 
+
 def eval_metrics(y_true, y_pred):
     return {
         "MAE": float(mean_absolute_error(y_true, y_pred)),
-        "RMSE": float(root_mean_squared_error(y_true, y_pred, squared=True)),
+        "RMSE": float(root_mean_squared_error(y_true, y_pred)),
         "MAPE": float(mean_absolute_percentage_error(y_true, y_pred)),
         "R2": float(r2_score(y_true, y_pred)),
     }
