@@ -68,6 +68,7 @@ def train_resnet(train_loader, val_loader, epochs=EPOCHS, lr=1e-3):
         y_true = torch.cat(y_true).cpu()
         y_pred = torch.cat(y_pred).cpu()
         val_rmse = root_mean_squared_error(y_true, y_pred)
+        print(f'Epoch {ep} RMSE Val: {val_rmse}')
 
         if val_rmse < best_val:
             best_val = val_rmse
