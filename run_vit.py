@@ -60,7 +60,7 @@ def train_vit(train_loader, val_loader, epochs=EPOCHS, lr=LR, wd=WEIGHT_DECAY):
     best_state = None
     patience_ctr = 0
 
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
 
     for ep in range(1, epochs + 1):
         # ---- train ----
